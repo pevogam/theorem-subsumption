@@ -1,0 +1,15 @@
+name = "theorem-subsumption"
+version = "0.1.0"
+defaultTargets = ["TheoremSubsumption", "Tests", "check", "Examples"]
+
+[[lean_lib]]
+name = "TheoremSubsumption"
+
+[[lean_lib]]
+name = "Tests"
+
+[[lean_lib]]
+name = "check"
+
+[[lean_lib]]
+name = "Examples"
