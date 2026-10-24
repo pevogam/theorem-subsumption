@@ -11,7 +11,7 @@ Edit this Markdown file first. Generate LaTeX/PDF/DOCX outputs from it;
 do not treat generated formats as authoritative sources.
 -->
 
-> Scope. The design distinguishes strictness from one-way provability, separates context-free guarantee strength from contextual adaptation, excludes blind whole-theorem implication from the default classifier, makes the proof background explicit, and requires closed kernel-checked certificates.
+> Scope. The design distinguishes strictness from one-way provability, separates context-free guarantee strength from contextual adaptation, excludes blind whole-theorem implication from the default classifier, makes the proof background explicit, requires certified semantic bridges for domain normalization, and requires closed kernel-checked certificates.
 
 **Proof-of-concept design for `#compare_theorems`**
 
@@ -28,7 +28,7 @@ Theorem generality can be made precise by generating explicit Lean proof obligat
 
 Three distinctions are essential. First, proving one direction while failing to prove the reverse does not establish strictness: reverse failure is UNKNOWN unless the reverse is actually refuted. Second, a conclusion implication proved in the target requirement context is a contextual adapter obligation, not the same thing as context-free guarantee strength. Third, blindly asking Lean to prove `T1 -> T2` in a library that already contains `T2` is vacuous, because the proof can simply use the target theorem.
 
-The design therefore makes the comparison mode, alignment, proof background, generated obligations, and dependencies part of every result. It also supports domain-specific comparators for cases such as numerical upper bounds, where comparing the promised bounds themselves is more informative than comparing already-proved propositions.
+The design therefore makes the comparison mode, alignment, proof background, generated obligations, and dependencies part of every result. It also supports domain-specific comparators for cases such as numerical upper bounds, where comparing the promised bounds themselves is more informative than comparing already-proved propositions. When such a comparator normalizes theorem statements into a semantic contract, the normalization itself is part of the proof obligation: theorem-level certification requires checked bridges connecting each original contract to the normalized interpretation. Without those bridges, Lean has certified only the normalized obligation, not the semantic claim about the original theorems.
 
 ## Design principles
 
@@ -41,6 +41,8 @@ The design therefore makes the comparison mode, alignment, proof background, gen
 - **Certificates over scores.** Heuristics may choose an alignment, but logical claims require closed proof objects.
 
 - **Background-relative results.** The allowed proof environment is explicit and dependencies are recorded.
+
+- **Certified semantic translation.** Domain normalization is theorem-level certified only when checked bridges justify transport between the original contracts and their normalized interpretations.
 
 # 1. Formal Core: Component-Wise Subsumption
 
@@ -234,33 +236,153 @@ Whether a generated proof term syntactically depends on the source guarantee is 
 |-------------------------|-----------------------------------------------------------|-------------------------------------------------------------------------------------------|
 | **Logical subsumption** | `$\Gamma_2 \rightsquigarrow \Gamma_1$` and `$\Delta \vdash C_1 \to C_2$` | `T1` has no stronger requirements and no weaker guarantee. |
 | **Contextual adapter** | `$\phi : \Gamma_2 \rightsquigarrow \Gamma_1$` and `$\Delta,\Gamma_2,C_1[\phi] \vdash C_2$` | A `T1` result can be adapted into the `T2` result under target requirements. |
-| **Domain comparator**   | Plugin-defined normalized semantic obligation             | Compare the underlying quantity/contract rather than already-proved theorem propositions. |
+| **Domain comparator**   | Normalized semantic obligation plus checked bridge(s) to the original contracts | Compare the underlying quantity/contract; theorem-level certification requires transport back to the originals. |
 
-The user-facing command may show all applicable modes, but the report must never collapse them into one undifferentiated “stronger theorem” label.
+The user-facing command may show all applicable modes, but the report must never collapse them into one undifferentiated “stronger theorem” label. A domain comparator must also distinguish a certified result about its normalized representation from a certified result about the original theorem contracts.
 
-# 7. Domain-Specific Semantic Comparison: Numerical Bounds
+# 7. Domain-Specific Semantic Comparison and Certified Normalization
 
 For upper-bound theorems, comparing two already-proved propositions about the actual quantity can be misleadingly easy. A more informative comparator abstracts the measured quantity and compares the bounds themselves.
 
-*(forall h : Nat, h <= U1(f) -> h <= U2(f)) <-> U1(f) <= U2(f)*
+$$(\forall h : \mathbb{N},\; h \le U_1(f) \to h \le U_2(f)) \leftrightarrow U_1(f) \le U_2(f)$$
 
-This obligation distinguishes the promised numerical bounds independently of the fact that either head-bound theorem already exists. It suggests a plugin interface for semantic comparators:
+This obligation distinguishes the promised numerical bounds independently of the fact that either head-bound theorem already exists. The same idea applies to lower bounds, norm bounds, cardinality bounds, error tolerances, monotone costs, and other semantic contracts.
+
+However, proving a comparison between normalized contracts does not by itself prove that the normalized contracts faithfully represent the original theorem statements. The semantic translation is therefore part of the certification boundary.
+
+## 7.1 The normalization trust gap
+
+Suppose original contracts `C1` and `C2` express upper bounds two and one, so the comparison needed to claim that the first is no weaker than the second is false. A defective normalizer could replace both with zero and generate the true normalized comparison:
+
+$$0 \le 0$$
+
+while the intended original comparison is false:
+
+$$\neg(2 \le 1).$$
+
+Lean can correctly certify the first proposition. That certificate says nothing about the original bounds unless the normalizer also supplies checked evidence connecting the original contracts to their normalized interpretations.
+
+The governing rule is therefore:
+
+> **A proof about a normalized contract certifies only that normalized proposition. A theorem-level semantic claim requires checked transport between the normalized contract and the original theorem contract.**
+
+## 7.2 Semantic bridges
+
+Let a plugin map original contracts `C1` and `C2` to normalized contracts `N1` and `N2`. The strongest simple bridge is equivalence:
+
+$$C_1 \leftrightarrow N_1$$
+
+and
+
+$$C_2 \leftrightarrow N_2.$$
+
+Together with a normalized comparison, these justify transport back to the original contracts:
+
+$$(C_1\leftrightarrow N_1) \land (C_2\leftrightarrow N_2)
+\Longrightarrow
+\bigl((N_1\to N_2)\leftrightarrow(C_1\to C_2)\bigr).$$
+
+Literal syntactic equality is not required. A domain plugin may use any correctness theorem appropriate to its semantics, provided that the theorem establishes the relationship needed to transport the comparison result.
+
+The bridge must cover every semantic choice that affects the claim, including where relevant:
+
+- the declared input mapping;
+- the ambient/shared context;
+- requirement transports or instantiated assumptions;
+- dependent witnesses introduced, eliminated, or abstracted by normalization;
+- the interpretation of theorem-specific syntax as a domain-specific semantic object.
+
+A kernel certificate validates the exact bridge proposition that Lean checks. It does not validate any stronger informal interpretation that the bridge does not state.
+
+## 7.3 Directed bridges are often sufficient
+
+Full equivalence is convenient but not always necessary. To transport a positive normalized edge
+
+$$N_1 \to N_2$$
+
+into an original edge
+
+$$C_1 \to C_2,$$
+
+it is sufficient to have the directed bridges
+
+$$C_1 \to N_1$$
+
+and
+
+$$N_2 \to C_2.$$
+
+They compose directly:
+
+$$C_1 \to N_1 \to N_2 \to C_2.$$
+
+The opposite directions are needed for different claims. In particular, to transport a normalized refutation
+
+$$\neg(N_1 \to N_2)$$
+
+into a refutation of the original comparison, the implementation must be able to turn any hypothetical original implication into a normalized implication. One sufficient pair of bridges is:
+
+$$N_1 \to C_1$$
+
+and
+
+$$C_2 \to N_2.$$
+
+Then any hypothetical `C1 -> C2` would induce `N1 -> N2`, contradicting the normalized refutation.
+
+Consequently, the semantic evidence needed for a positive edge, a refutation, an equivalence, or strictness may differ. The plugin interface should expose exactly which bridge directions are certified rather than treating normalization as an opaque function.
+
+## 7.4 Plugin interface
+
+A semantic comparator should return both a normalized representation and checked evidence relating it to the original contract. Conceptually:
 
 ```lean
+structure SemanticBridge where
+  original   : Expr
+  normalized : Expr
+
+  originalToNormalized : Option Expr
+  normalizedToOriginal : Option Expr
+
+structure NormalizedContract where
+  contract : Expr
+  bridge   : SemanticBridge
+
 class SemanticComparator where
+  recognizes : Expr → MetaM Bool
 
-recognizes : Expr → MetaM Bool
+  normalize :
+    theoremType : Expr →
+    alignment : Alignment →
+    background : ComparisonBackground →
+    MetaM NormalizedContract
 
-normalize : Expr → MetaM NormalizedContract
-
-compare : NormalizedContract → NormalizedContract → MetaM ComparisonReport
+  compare :
+    left : NormalizedContract →
+    right : NormalizedContract →
+    MetaM ComparisonReport
 ```
 
-Natural early domains include upper/lower bounds, norm bounds, cardinality bounds, error tolerances, and monotone cost measures. For theorem-library curation, these comparators may be more informative than raw proposition implication.
+For dependent or structured domains, `SemanticBridge` may need a richer representation than a pair of implications. The essential requirement is unchanged: the comparator must produce proof objects sufficient to justify transport of its result back to the original theorem contracts.
+
+## 7.5 Certification levels
+
+A plugin may deliberately omit a semantic bridge. That can still be useful for exploration, ranking, search, or user-guided interpretation, but the result must expose the trust boundary explicitly.
+
+Use two certification levels:
+
+- **NORMALIZED PROVED.** Lean certified the plugin-generated normalized obligation. No theorem-level semantic claim is implied unless the required bridges are also certified.
+- **THEOREM-LEVEL PROVED.** Lean certified the normalized comparison, the required semantic bridges, and their composition into the claimed proposition about the original contracts.
+
+The same distinction applies to refutations and equivalences.
+
+Whenever practical, normalization should be implemented as theorem-guided abstraction rather than unchecked expression rewriting. The normalized representation may still enable efficient specialized decision procedures, but the final theorem-level classification should be obtained by composing explicit correctness theorems.
 
 # 8. Certification Boundary
 
-A tactic success flag or an in-memory `Expr` is not yet the final notion of certification. The implementation must close the proof object and cross Lean's normal checking boundary.
+A tactic success flag or an in-memory `Expr` is not yet the final notion of certification. The implementation must close the proof object and cross Lean's normal checking boundary. When semantic normalization is involved, the normalization bridge is part of the certificate path rather than a trusted preprocessing step.
+
+For ordinary logical or contextual comparison, the certification path is:
 
 **1.** Proof search produces a candidate expression for the exact generated obligation.
 
@@ -270,11 +392,47 @@ A tactic success flag or an in-memory `Expr` is not yet the final notion of cert
 
 **4.** Insert or otherwise check the declaration through Lean's normal declaration/kernel checking path.
 
-5\. Record declaration dependencies and axiom usage.
+**5.** Record declaration dependencies and axiom usage.
 
 **6.** Only then mark the comparison edge CERTIFIED / PROVED.
 
-> **Certification rule.** “PROVED” in the public report should mean a closed proof artifact has been accepted by Lean, not merely that a tactic returned without error.
+For a domain comparator that normalizes theorem contracts, theorem-level certification extends the path:
+
+```text
+Original theorem contracts C1, C2
+        │
+        ▼
+Declared alignment / context / requirements
+        │
+        ▼
+Normalized contracts N1, N2
+        │
+        ├──── certified semantic bridges ────┐
+        │                                    │
+        ▼                                    │
+Proof of normalized comparison              │
+        │                                    │
+        └──────── compose / transport ◄──────┘
+                         │
+                         ▼
+Proof about original contracts
+                         │
+                         ▼
+Instantiate metavariables and close context
+                         │
+                         ▼
+Kernel-check emitted declaration
+                         │
+                         ▼
+Record dependencies and axioms
+                         │
+                         ▼
+THEOREM-LEVEL CERTIFIED RESULT
+```
+
+If the normalized comparison is certified but the required semantic bridge is absent, incomplete, or trusted externally, the public result must stop at **NORMALIZED PROVED** (or the analogous normalized refutation/equivalence status). It must not be labeled a kernel-certified semantic comparison of the original theorems.
+
+> **Certification rule.** “PROVED” at theorem level means that a closed proof of the claimed proposition about the original theorem contracts has been accepted by Lean. Certification of an intermediate normalized proposition is reported separately unless checked semantic bridges justify the transport.
 
 # 9. PoC Command and Report
 
@@ -321,6 +479,16 @@ uses source result : yes
 
 dependencies : [Int.order, ...]
 
+DOMAIN COMPARATOR (when applicable)
+
+normalized N1 => N2 : PROVED [certificate normalized_1_to_2]
+
+bridge C1 => N1 : PROVED [certificate bridge_left]
+
+bridge N2 => C2 : PROVED [certificate bridge_right]
+
+transported C1 => C2 : THEOREM-LEVEL PROVED [certificate semantic_1_to_2]
+
 CERTIFICATION
 
 closed / kernel checked : yes
@@ -334,84 +502,107 @@ If a reverse direction is UNKNOWN, the output must say “subsumes; strictness u
 
 ```lean
 inductive ProofStatus where
-| proved
-| refuted
-| unknown
+  | proved
+  | refuted
+  | unknown
+
+inductive CertificationLevel where
+  | normalized
+  | theoremLevel
 
 structure BinderView where
-
-fvar : Expr
-
-type : Expr
-
-binderInfo : BinderInfo
-
-role : BinderRole
+  fvar : Expr
+  type : Expr
+  binderInfo : BinderInfo
+  role : BinderRole
 
 structure Attempt where
+  status : ProofStatus
+  certificationLevel? : Option CertificationLevel
+  certificate? : Option Name
+  dependencies : Array Name
+  axioms : Array Name
+  tacticTrace? : Option String
 
-status : ProofStatus
+structure SemanticBridge where
+  original : Expr
+  normalized : Expr
+  originalToNormalized? : Option Name
+  normalizedToOriginal? : Option Name
 
-certificate? : Option Name
+structure NormalizedContract where
+  contract : Expr
+  bridge : SemanticBridge
 
-dependencies : Array Name
-
-axioms : Array Name
-
-tacticTrace? : Option String
+structure SemanticComparison where
+  left : NormalizedContract
+  right : NormalizedContract
+  normalizedAttempt : Attempt
+  transportedAttempt? : Option Attempt
 
 structure ComparisonReport where
-
-alignment : Alignment
-
-req_2_to_1 : Attempt
-
-req_1_to_2 : Attempt
-
-guarantee_1_to_2 : Attempt
-
-guarantee_2_to_1 : Attempt
-
-adapter_1_to_2? : Option Attempt
-
-adapter_2_to_1? : Option Attempt
+  alignment : Alignment
+  req_2_to_1 : Attempt
+  req_1_to_2 : Attempt
+  guarantee_1_to_2 : Attempt
+  guarantee_2_to_1 : Attempt
+  adapter_1_to_2? : Option Attempt
+  adapter_2_to_1? : Option Attempt
+  semanticComparisons : Array SemanticComparison
 ```
 
-The exact records may differ, but every proved/refuted edge should be tied to a closed certificate or reproducible generated declaration.
+The exact records may differ, but every proved/refuted edge should be tied to a closed certificate or reproducible generated declaration. A semantic comparison additionally records whether the certificate is only about the normalized obligation or has been transported through checked bridges to the original theorem contracts.
 
 # 11. Core Algorithm
 
 ```text
 compare(T1, T2):
 
-ty1 <- typeOf(T1)
+  ty1 <- typeOf(T1)
+  ty2 <- typeOf(T2)
 
-ty2 <- typeOf(T2)
+  tel1, C1 <- openTelescope(ty1)
+  tel2, C2 <- openTelescope(ty2)
 
-tel1, C1 <- openTelescope(ty1)
+  roles1, roles2 <- classifyBinders(tel1, tel2)
+  alignment <- alignSharedInputs(tel1, tel2, roles1, roles2)
 
-tel2, C2 <- openTelescope(ty2)
+  req_2_to_1 <- buildTransport(source=tel2, target=tel1, alignment)
+  req_1_to_2 <- buildTransport(source=tel1, target=tel2, reverse(alignment))
 
-roles1, roles2 <- classifyBinders(tel1, tel2)
+  guar_1_to_2 <- proveContextFreeGuarantee(C1, C2, alignment, background)
+  guar_2_to_1 <- proveContextFreeGuarantee(C2, C1, reverse(alignment), background)
 
-alignment <- alignSharedInputs(tel1, tel2, roles1, roles2)
+  adapter_1_to_2 <- deriveAdapter(req_2_to_1, C1, C2, targetContext)
+  adapter_2_to_1 <- deriveAdapter(req_1_to_2, C2, C1, sourceContext)
 
-req_2_to_1 <- buildTransport(source=tel2, target=tel1, alignment)
+  for plugin in applicableSemanticComparators(ty1, ty2):
+    N1 <- plugin.normalize(ty1, alignment, background)
+    N2 <- plugin.normalize(ty2, reverse(alignment), background)
 
-req_1_to_2 <- buildTransport(source=tel1, target=tel2, reverse(alignment))
+    certifyAvailableBridgeDirections(N1.bridge)
+    certifyAvailableBridgeDirections(N2.bridge)
 
-guar_1_to_2 <- proveContextFreeGuarantee(C1, C2, alignment, background)
+    normalized <- plugin.compare(N1, N2)
+    certifyNormalizedResult(normalized)
 
-guar_2_to_1 <- proveContextFreeGuarantee(C2, C1, reverse(alignment), background)
+    transported <- transportThroughCertifiedBridges(
+      originalLeft=C1,
+      normalizedLeft=N1,
+      normalizedResult=normalized,
+      normalizedRight=N2,
+      originalRight=C2)
 
-adapter_1_to_2 <- deriveAdapter(req_2_to_1, C1, C2, targetContext)
+    if transported succeeds:
+      certifyTheoremLevelResult(transported)
+    else:
+      retainNormalizedCertificationOnly()
 
-adapter_2_to_1 <- deriveAdapter(req_1_to_2, C2, C1, sourceContext)
-
-certifyEverySuccessfulEdge()
-
-return classifyWithoutCollapsingUnknown()
+  certifyEverySuccessfulEdge()
+  return classifyWithoutCollapsingUnknown()
 ```
+
+The semantic-comparator path deliberately separates three facts: that normalization ran, that the normalized obligation was proved, and that the result was transported back to the original contracts. Only the third supports theorem-level semantic certification.
 
 ## 11.1 Requirement transport
 
@@ -457,11 +648,13 @@ Each attempt records the tactic path, resource budget, and dependencies. A proof
 
 - **Relations.** Both requirement directions, both context-free guarantee directions, and derived contextual adapters.
 
+- **Semantic plugins.** Any domain comparator included in the MVP must return checked bridge evidence for theorem-level claims; otherwise its result is explicitly normalized-only.
+
 - **Statuses.** PROVED / REFUTED / UNKNOWN, with strictness only from certified reverse refutation.
 
 - **Background.** Compared theorem declarations forbidden by default in component search; dependencies always recorded.
 
-- **Certification.** Successful edges materialized as closed, kernel-checked declarations with recorded axiom dependencies.
+- **Certification.** Successful theorem-level edges materialized as closed, kernel-checked declarations with recorded axiom dependencies. Normalized-only plugin results are labeled separately and never promoted without checked transport.
 
 - **Verbose mode.** Print full contexts, input maps, generated obligations, and certificate names.
 
@@ -473,17 +666,18 @@ Evaluate on curated theorem families with known relationships: arithmetic bounds
 
 | **Item**              | **Meaning**                                                                                               |
 |-----------------------|-----------------------------------------------------------------------------------------------------------|
-| **Soundness**         | Every positive/negative logical claim has a Lean certificate; no tactic failure is counted as refutation. |
+| **Soundness**         | Every positive/negative theorem-level claim has a Lean certificate; no tactic failure is counted as refutation. |
+| **Semantic fidelity**  | Every theorem-level domain comparison has checked bridges from the original contracts through normalization and back in the directions required by the claim. |
 | **Coverage**          | Fraction of curated relations settled versus UNKNOWN.                                                     |
 | **Alignment quality** | Number of heuristic alignments requiring correction or explicit override.                                 |
 | **Cost**              | Runtime / heartbeats per attempted relation and per corpus cluster.                                       |
 | **Diagnostics**       | Whether dependency reports reveal trivial or background-driven proofs.                                    |
 
-If the comparator is used for theorem-library curation, emit a machine-readable selection manifest containing theorem pairs, alignment, roles, background policy, generated obligations, statuses, certificate names, dependencies, tool version, and search budget. The design document itself is not evidence that such a selection policy was executed.
+If the comparator is used for theorem-library curation, emit a machine-readable selection manifest containing theorem pairs, alignment, roles, background policy, generated obligations, statuses, certificate names, dependencies, semantic-plugin identifiers, normalization contracts, bridge certificates, certification level, tool version, and search budget. The design document itself is not evidence that such a selection policy was executed.
 
 # 15. Library-Scale Use
 
-At corpus scale, comparisons form a directed graph. Certified component-wise edges can identify dominated lemmas; adapter edges can support theorem discovery; domain-comparator edges can identify genuinely tighter numerical or semantic guarantees.
+At corpus scale, comparisons form a directed graph. Certified component-wise edges can identify dominated lemmas; adapter edges can support theorem discovery; theorem-level domain-comparator edges can identify genuinely tighter numerical or semantic guarantees. Normalized-only plugin results should remain separately annotated so they are not mistaken for certified relations between the original theorems.
 
 To avoid quadratic search over an entire library, first cluster candidates by namespace, head symbols, normalized telescope fingerprints, result-type skeletons, and registered semantic domains. Run expensive semantic checks only inside plausible clusters.
 
@@ -495,16 +689,16 @@ Subsumption is not a total ranking of mathematical or research value. Incomparab
 |----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Phase 1  | Positional alignment; explicit role overrides; tri-state/refutation semantics; context-free guarantee mode; derived adapters; closed certificates; dependency report. |
 | Phase 2  | Bounded structural matching for reordered inputs; richer dependent transports; better background policies; proof caching.                                             |
-| Phase 3  | Domain comparator plugins; certified counterexample/refutation backends where available; corpus indexing and selection manifests.                                     |
+| Phase 3  | Domain comparator plugins with certified semantic bridges; certified counterexample/refutation backends where available; corpus indexing and selection manifests.     |
 | Phase 4  | Library tooling: find subsumed lemmas, find stronger guarantees, detect accidental duplicate APIs, and CI linting.                                                    |
 
 # 17. Conclusion
 
 Certified theorem subsumption should not be framed as asking automation which theorem is “better” or “stronger” in the abstract. The robust design is to select a precise relation, print the exact obligation, search within an explicit background, close and kernel-check the resulting proof, preserve UNKNOWN, and report only the label warranted by that proposition.
 
-With those constraints, Lean metaprogramming is a strong fit: metaprogramming supplies the telescope inspection, alignment, goal construction, tactic orchestration, and certificate plumbing; tactics supply incomplete but useful search; domain plugins supply semantically appropriate normalization; and the kernel supplies trust.
+With those constraints, Lean metaprogramming is a strong fit: metaprogramming supplies the telescope inspection, alignment, goal construction, tactic orchestration, semantic-bridge composition, and certificate plumbing; tactics supply incomplete but useful search; domain plugins supply semantically appropriate normalization together with checked correctness evidence or an explicit trust boundary; and the kernel supplies trust for exactly the propositions that are closed and checked.
 
-> Design principle. Automate discovery. Certify exact propositions. Separate comparison modes. Preserve uncertainty. Record dependencies.
+> Design principle. Automate discovery. Certify exact propositions. Certify semantic bridges. Separate comparison modes. Preserve uncertainty. Record dependencies.
 
 # References and Implementation Notes
 
