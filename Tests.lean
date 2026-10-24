@@ -1,4 +1,4 @@
-import TheoremSubsumption
+import Examples
 
 open Lean Meta Elab TheoremSubsumption
 
@@ -209,5 +209,158 @@ run_cmd Command.liftTermElabM do
 /-- error: role override count 1 does not match binder count 2 -/
 #guard_msgs in
 #compare_theorems tighter looser (roles1 := [sharedInput])
+
+-- Phase 2: structural alignment must be unique before any relation is searched.
+theorem mixed1 (n : Nat) (x : Int) (h : x > 0) : n = n ∧ x ≥ 1 := by omega
+theorem mixed2 (y : Int) (m : Nat) (h : y > 10) : m = m ∧ y ≥ 0 := by omega
+
+run_cmd Command.liftTermElabM do
+  let positional ← compareTheorems ``mixed1 ``mixed2
+  expect (positional.classification == "UNKNOWN") "positional mode silently reordered inputs"
+  let structural ← compareTheorems ``mixed1 ``mixed2 { alignment := .structural }
+  expect (structural.inputMap == #[2, 1]) s!"wrong structural map: {structural.format}"
+  expect (structural.classification == "source strictly subsumes target under this alignment")
+    s!"reordered arithmetic comparison failed: {structural.format}"
+  checkCertificates structural
+  let exhausted ← compareTheorems ``mixed1 ``mixed2 { alignment := .structural, maxAlignmentSteps := 1 }
+  expect (exhausted.classification == "UNKNOWN" && exhausted.alignmentSearchSteps == 1)
+    "exhausted alignment search must preserve UNKNOWN"
+
+theorem twoNats1 (a b : Nat) : a + b = b + a := Nat.add_comm a b
+theorem twoNats2 (c d : Nat) : c + d = d + c := Nat.add_comm c d
+theorem dependentOrder1 (n _m : Nat) (i : Fin n) : i.val < n := i.isLt
+theorem dependentOrder2 (_m n : Nat) (j : Fin n) : j.val < n := j.isLt
+
+run_cmd Command.liftTermElabM do
+  let ambiguous ← compareTheorems ``twoNats1 ``twoNats2 { alignment := .structural }
+  expect (ambiguous.classification == "UNKNOWN" && ambiguous.diagnostic.startsWith "ambiguous")
+    "same-type permutations must remain ambiguous even if their conclusions are provable"
+  expect ambiguous.req_2_to_1.certificate?.isNone "ambiguous alignment emitted a certificate"
+  let explicit ← compareTheorems ``twoNats1 ``twoNats2 { alignment := .explicit, mapping := #[2, 1] }
+  expect (explicit.classification == "equivalent under this alignment") s!"explicit map failed: {explicit.format}"
+  checkCertificates explicit
+  let invalid ← compareTheorems ``twoNats1 ``twoNats2 { alignment := .explicit, mapping := #[1, 1] }
+  expect (invalid.classification == "UNKNOWN") "non-bijective explicit map was accepted"
+  let dependent ← compareTheorems ``dependentOrder1 ``dependentOrder2 { alignment := .structural }
+  expect (dependent.inputMap == #[2, 1, 3]) s!"dependent matching did not backtrack: {dependent.format}"
+  expect (dependent.classification == "equivalent under this alignment") "dependent alignment comparison"
+  checkCertificates dependent
+
+theorem interleaved1 (α : Type u) [Base α] (_f : α → α) : True := True.intro
+theorem interleaved2 (β : Type v) (_g : β → β) [Derived β] : True := True.intro
+
+class Dimension where
+  size : Nat
+
+theorem cannotMove1 [Dimension] (_i : Fin Dimension.size) : True := True.intro
+theorem cannotMove2 [Dimension] (_j : Fin Dimension.size) : True := True.intro
+
+run_cmd Command.liftTermElabM do
+  let r ← compareTheorems ``interleaved1 ``interleaved2 { alignment := .structural }
+  expect (r.req_2_to_1.status == .proved && r.adapter_1_to_2.status == .proved)
+    s!"interleaved instance transport failed: {r.format}"
+  checkCertificates r
+  let unsupported ← compareTheorems ``cannotMove1 ``cannotMove2 { alignment := .structural }
+  expect (unsupported.classification == "UNKNOWN" && !unsupported.diagnostic.isEmpty)
+    "an input depending on a removed requirement was moved out of scope"
+  let noSynthesis ← compareTheorems ``baseResult ``derivedResult { synthInstances := false }
+  expect (noSynthesis.req_2_to_1.status == .unknown) "instance synthesis policy was ignored"
+
+structure Box (α : Type u) where
+  value : α
+
+theorem needsSubtype (P : Nat → Prop) (s : Subtype P) : P s.val := s.property
+theorem needsBox (P : Nat → Prop) (s : Box (Subtype P)) : P s.value.val := s.value.property
+theorem hasPieces (P : Nat → Prop) (n : Nat) (h : P n) : P n := h
+theorem hasFunction (P : Nat → Prop) (f : Nat → Subtype P) (n : Nat) : P (f n).val := (f n).property
+def boxFromInstance {α : Type u} [Inhabited α] : Box α := ⟨default⟩
+theorem needsNatBox (_s : Box Nat) : True := True.intro
+theorem noRequirements : True := True.intro
+
+run_cmd Command.liftTermElabM do
+  let roles1 := #[BinderRole.sharedInput, .witness]
+  let roles2 := #[BinderRole.sharedInput, .witness, .requirement]
+  let r ← compareTheorems ``needsSubtype ``hasPieces {
+    roles1, roles2, constructors := #[``Subtype.mk]
+  }
+  expect (r.req_2_to_1.status == .proved && r.adapter_1_to_2.status == .proved)
+    s!"dependent constructor transport failed: {r.format}"
+  checkCertificates r
+  let nested ← compareTheorems ``needsBox ``hasPieces {
+    roles1, roles2, constructors := #[``Box.mk, ``Subtype.mk], transportDepth := 2
+  }
+  expect (nested.req_2_to_1.status == .proved) s!"nested constructor search failed: {nested.format}"
+  checkCertificates nested
+  let bounded ← compareTheorems ``needsBox ``hasPieces {
+    roles1, roles2, constructors := #[``Box.mk, ``Subtype.mk], transportDepth := 0
+  }
+  expect (bounded.req_2_to_1.status == .unknown) "constructor depth bound was ignored"
+  let localFunction ← compareTheorems ``needsSubtype ``hasFunction {
+    roles1, roles2 := #[.sharedInput, .witness, .witness]
+  }
+  expect (localFunction.req_2_to_1.status == .proved)
+    s!"local function transport failed: {localFunction.format}"
+  checkCertificates localFunction
+  let instanceBuilder ← compareTheorems ``needsNatBox ``noRequirements {
+    roles1 := #[.witness], constructors := #[``boxFromInstance]
+  }
+  expect (instanceBuilder.req_2_to_1.status == .proved) "builder instance synthesis failed"
+  checkCertificates instanceBuilder
+  let noBuilderSynthesis ← compareTheorems ``needsNatBox ``noRequirements {
+    roles1 := #[.witness], constructors := #[``boxFromInstance], synthInstances := false
+  }
+  expect (noBuilderSynthesis.req_2_to_1.status == .unknown)
+    "a builder bypassed the instance synthesis policy"
+
+-- Cached certificates must never cross a background policy boundary.
+run_cmd Command.liftTermElabM do
+  let first ← compareTheorems ``mixed1 ``mixed2 { alignment := .structural }
+  let repeated ← compareTheorems ``mixed1 ``mixed2 { alignment := .structural }
+  expect (repeated.guarantee_1_to_2.cacheHit && repeated.req_1_to_2.cacheHit)
+    "positive and negative certificate cache did not hit"
+  expect (first.guarantee_1_to_2.certificate? == repeated.guarantee_1_to_2.certificate?)
+    "a cache hit should reuse the existing certificate"
+  checkCertificates repeated
+  let disabled ← compareTheorems ``mixed1 ``mixed2 { alignment := .structural, cache := false }
+  expect (!disabled.guarantee_1_to_2.cacheHit) "cache opt-out was ignored"
+  let allowed ← compareTheorems ``closedSource ``closedTarget { facts := #[``secretProof] }
+  expect (allowed.guarantee_1_to_2.status == .proved) "explicit background fact"
+  let denied ← compareTheorems ``closedSource ``closedTarget {
+    facts := #[``secretProof], forbiddenDecls := #[``secretProof]
+  }
+  expect (denied.guarantee_1_to_2.status == .unknown && !denied.guarantee_1_to_2.cacheHit)
+    "cache bypassed a forbidden dependency"
+  let noAxioms ← compareTheorems ``closedSource ``closedTarget {
+    facts := #[``secretProof], allowedAxioms? := some #[]
+  }
+  expect (noAxioms.guarantee_1_to_2.status == .unknown) "cache bypassed the axiom allowlist"
+  let permitted ← compareTheorems ``closedSource ``closedTarget {
+    facts := #[``secretProof], allowedAxioms? := some #[``secretProof]
+  }
+  expect (permitted.guarantee_1_to_2.status == .proved) "allowed axiom was rejected"
+  checkCertificates permitted
+  let unknown1 ← compareTheorems ``easy ``hard
+  let unknown2 ← compareTheorems ``easy ``hard
+  expect (!unknown1.req_1_to_2.cacheHit && !unknown2.req_1_to_2.cacheHit) "UNKNOWN results were cached"
+  let imported ← compareTheorems ``Examples.tighter ``Examples.looser
+  expect (imported.req_2_to_1.cacheHit && imported.req_1_to_2.cacheHit)
+    "certificate cache did not survive a module import"
+  checkCertificates imported
+
+#guard_msgs (drop info) in
+#compare_theorems twoNats1 twoNats2
+  (alignment := .explicit)
+  (mapping := [2, 1])
+  (maxAlignmentSteps := 32)
+  (constructors := [])
+  (transportDepth := 2)
+  (forbidden := [])
+  (allowedAxioms := [])
+  (synthInstances := false)
+  (cache := false)
+  (json := true)
+
+#guard_msgs (drop info) in
+#compare_theorems mixed1 mixed2 (alignment := .structural)
 
 end Tests

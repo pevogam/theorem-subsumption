@@ -21,12 +21,30 @@ inductive ComparisonMode where
   | all | logical | contextual
   deriving BEq, Repr, Inhabited
 
+inductive AlignmentMode where
+  | positional | structural | explicit
+  deriving BEq, Repr, Inhabited
+
+def AlignmentMode.label : AlignmentMode → String
+  | .positional => "positional"
+  | .structural => "structural"
+  | .explicit => "explicit"
+
 structure Config where
   roles1 : Array BinderRole := #[]
   roles2 : Array BinderRole := #[]
   mode : ComparisonMode := .all
+  alignment : AlignmentMode := .positional
+  mapping : Array Nat := #[]
+  maxAlignmentSteps : Nat := 256
   heartbeat : Nat := 200000
   facts : Array Name := #[]
+  forbiddenDecls : Array Name := #[]
+  allowedAxioms? : Option (Array Name) := none
+  synthInstances : Bool := true
+  constructors : Array Name := #[]
+  transportDepth : Nat := 4
+  cache : Bool := true
   verbose : Bool := false
   json : Bool := false
   deriving Inhabited
@@ -41,6 +59,7 @@ structure Attempt where
   wellFormed : Bool := true
   usesSourceResult : Bool := false
   usesTargetDecl : Bool := false
+  cacheHit : Bool := false
   deriving Inhabited
 
 structure ComparisonReport where
@@ -48,6 +67,8 @@ structure ComparisonReport where
   target : Name
   config : Config
   alignment : Array String := #[]
+  inputMap : Array Nat := #[]
+  alignmentSearchSteps : Nat := 0
   roles : Array String := #[]
   diagnostic : String := ""
   req_2_to_1 : Attempt := {}
@@ -73,8 +94,35 @@ partial def dependencies (env : Environment) (roots : Array Name) : Array Name :
       todo := info.getUsedConstantsAsSet.toList ++ todo
   return seen.toArray.qsort Name.lt
 
-private def background : String :=
+private def background (cfg : Config) : String :=
   "local assumptions and explicit facts; definitional equality; global typeclass instances; trivial; omega; grind only"
+    ++ s!"; synthesize instance requirements: {cfg.synthInstances}; constructors: {cfg.constructors}"
+
+private structure CachePolicy where
+  facts : Array Name
+  forbidden : Array Name
+  allowedAxioms? : Option (Array Name)
+  synthInstances : Bool
+  constructors : Array Name
+  transportDepth : Nat
+  trackSource : Bool
+  deriving BEq, Inhabited
+
+private def cachePolicy (cfg : Config) (forbidden : Array Name) (trackSource : Bool) : CachePolicy :=
+  { facts := cfg.facts, forbidden := forbidden ++ cfg.forbiddenDecls,
+    allowedAxioms? := cfg.allowedAxioms?, synthInstances := cfg.synthInstances,
+    constructors := cfg.constructors, transportDepth := cfg.transportDepth, trackSource }
+
+private structure CacheEntry where
+  policy : CachePolicy
+  result : Attempt
+  deriving Inhabited
+
+private initialize proofCache : SimplePersistentEnvExtension CacheEntry (Array CacheEntry) ←
+  registerSimplePersistentEnvExtension {
+    addEntryFn := Array.push
+    addImportedFn := fun entries => entries.foldl (· ++ ·) #[]
+  }
 
 private def propositionText (e : Expr) : MetaM String := do
   let e ← Core.betaReduce (← instantiateMVars e)
@@ -99,13 +147,44 @@ private def proofSearch (goal : Expr) (cfg : Config) : TermElabM (Option Expr) :
     saved.restore
     return none
 
-private def findTerm (type : Expr) (bi : BinderInfo) (cfg : Config) : TermElabM (Option Expr) := do
+private def explicitInstanceBinders : Expr → Expr
+  | .lam n type body bi =>
+    .lam n type (explicitInstanceBinders body) (if bi == .instImplicit then .default else bi)
+  | e => e
+
+private partial def findTerm (type : Expr) (bi : BinderInfo) (cfg : Config)
+    (depth : Nat) : TermElabM (Option Expr) := do
   for localDecl in ← getLCtx do
     if localDecl.isImplementationDetail then continue
     if ← isDefEq localDecl.type type then return some localDecl.toExpr
-  if bi == .instImplicit then
+  if bi == .instImplicit && cfg.synthInstances then
     if let some inst ← synthInstance? type then return some inst
-  if ← isProp type then return ← proofSearch type cfg
+  if ← isProp type then
+    if let some proof ← proofSearch type cfg then return some proof
+  if depth == 0 then return none
+  let mut builders := #[]
+  for decl in ← getLCtx do
+    if !decl.isImplementationDetail && decl.type.isForall then builders := builders.push decl.toExpr
+  for name in cfg.constructors do builders := builders.push (← mkConstWithFreshMVarLevels name)
+  for builder in builders do
+    let saved ← saveState
+    try
+      -- `apply` normally synthesizes instance arguments, including in builders.
+      let builder ← if cfg.synthInstances then pure builder else
+        forallTelescope (← inferType builder) fun xs _ => do
+          return explicitInstanceBinders (← mkLambdaFVars xs (mkAppN builder xs))
+      let goal ← mkFreshExprSyntheticOpaqueMVar type
+      let goals ← goal.mvarId!.apply builder { allowSynthFailures := true, synthAssignedInstances := false }
+      for subgoal in goals do
+        unless ← subgoal.isAssigned do
+          let target ← instantiateMVars (← subgoal.getType)
+          let some value ← findTerm target .default cfg (depth - 1)
+            | throwError "cannot construct builder argument"
+          subgoal.assign value
+      let value ← instantiateMVars goal
+      unless value.hasMVar do return some value
+    catch _ => pure ()
+    saved.restore
   return none
 
 /-- A dependent requirement bundle stays in Prop, including data-valued witnesses. -/
@@ -117,7 +196,7 @@ private partial def requirementBundle (type : Expr) : MetaM Expr := do
   return mkConst ``True
 
 private def certify (goal proof : Expr) (forbidden : Array Name)
-    (trace : String) (usesSource := false) : TermElabM Attempt := do
+    (trace : String) (usesSource := false) (cfg : Config := {}) : TermElabM Attempt := do
   let obligation ← propositionText goal
   let env ← getEnv
   try
@@ -131,7 +210,7 @@ private def certify (goal proof : Expr) (forbidden : Array Name)
     unless ← isDefEq (← inferType proof) goal do throwError "certificate type mismatch"
     let deps := dependencies (← getEnv) (proof.getUsedConstants ++ goal.getUsedConstants)
     if deps.contains ``sorryAx then throwError "certificate depends on sorryAx"
-    for name in forbidden do
+    for name in forbidden ++ cfg.forbiddenDecls do
       if deps.contains name then throwError "forbidden dependency: {name}"
     let certificatePrefix := (← getMainModule) ++ `subsumptionCertificate
     let mut index := 1
@@ -143,12 +222,16 @@ private def certify (goal proof : Expr) (forbidden : Array Name)
     -- Disable asynchronous checking: PROVED is returned only after kernel acceptance.
     withOptions (fun opts => Elab.async.set opts false) do
       addDecl <| .thmDecl { name, levelParams := levels, type := goal, value := proof }
+    let axioms ← collectAxioms name
+    if let some allowed := cfg.allowedAxioms? then
+      for axiomName in axioms do
+        unless allowed.contains axiomName do throwError "axiom is not allowed: {axiomName}"
     return {
       status := .proved
       obligation := ← propositionText goal
       certificate? := some name
       dependencies := deps
-      axioms := ← collectAxioms name
+      axioms
       trace
       usesSourceResult := usesSource
     }
@@ -189,31 +272,64 @@ private def usesLastInput (type proof : Expr) : MetaM Bool :=
     let body ← Core.betaReduce (mkAppN proof xs)
     return xs.back?.any (fun x => body.containsFVar x.fvarId!)
 
+private def cachedAttempt (goal : Expr) (policy : CachePolicy) : TermElabM (Option Attempt) := do
+  for entry in (proofCache.getState (← getEnv)).reverse do
+    unless entry.policy == policy do continue
+    let some name := entry.result.certificate? | continue
+    let saved ← saveState
+    try
+      let .thmInfo _ ← getConstInfo name | throwError "missing cached theorem"
+      let proof ← mkConstWithFreshMVarLevels name
+      let expected := if entry.result.status == .refuted then mkApp (mkConst ``Not) goal else goal
+      unless ← isDefEq (← inferType proof) expected do throwError "different obligation"
+      let deps := dependencies (← getEnv) #[name]
+      for forbidden in policy.forbidden do
+        if deps.contains forbidden then throwError "forbidden cached dependency"
+      if deps.contains ``sorryAx then throwError "cached placeholder"
+      let axioms ← collectAxioms name
+      if let some allowed := policy.allowedAxioms? then
+        unless axioms.all allowed.contains do throwError "cached axiom is not allowed"
+      return some { entry.result with
+        obligation := ← propositionText goal
+        cacheHit := true
+        trace := s!"cached certificate: {name}"
+      }
+    catch _ => saved.restore
+  return none
+
+private def cacheAttempt (policy : CachePolicy) (result : Attempt) (enabled : Bool) : TermElabM Attempt := do
+  if enabled && result.status != .unknown && result.certificate?.isSome then
+    modifyEnv (proofCache.addEntry · { policy, result })
+  return result
+
 private def attempt (goal : Expr) (sharedCount : Nat) (cfg : Config)
     (forbidden : Array Name) (candidate? : Option Expr := none)
     (trackSource := false) : TermElabM Attempt :=
   withOptions (fun opts => maxHeartbeats.set opts cfg.heartbeat) <| withCurrHeartbeats do
+    let policy := cachePolicy cfg forbidden trackSource
+    if cfg.cache then
+      if let some result ← cachedAttempt goal policy then return result
     let mut trace := "bounded search did not certify the obligation or its negation"
     try
       if let some proof ← (if candidate?.isSome then pure candidate? else proofSearch goal cfg) then
-        let result ← certify goal proof forbidden "constructive transport / local, omega, grind-only portfolio"
+        let result ← certify goal proof forbidden "constructive transport / local, omega, grind-only portfolio" (cfg := cfg)
         if result.status == .proved then
           let usesSource ← if trackSource then usesLastInput goal proof else pure false
-          return { result with usesSourceResult := usesSource }
+          return ← cacheAttempt policy { result with usesSourceResult := usesSource } cfg.cache
         trace := result.trace
       let negGoal := mkApp (mkConst ``Not) goal
       if let some proof ← proofSearch negGoal cfg then
-        let result ← certify negGoal proof forbidden "negated obligation: local / omega / grind-only"
+        let result ← certify negGoal proof forbidden "negated obligation: local / omega / grind-only" (cfg := cfg)
         if result.status == .proved then
-          return { result with status := .refuted, obligation := ← propositionText goal }
+          return ← cacheAttempt policy { result with status := .refuted, obligation := ← propositionText goal } cfg.cache
         trace := result.trace
       let proof? ← withLocalDeclD `relation goal fun h => do
         let (some contradiction, _) ← refuteAt h goal sharedCount cfg 64 | return none
         return some (← mkLambdaFVars #[h] contradiction)
       if let some proof := proof? then
-        let result ← certify negGoal proof forbidden "negated obligation: concrete shared-input witness"
+        let result ← certify negGoal proof forbidden "negated obligation: concrete shared-input witness" (cfg := cfg)
         if result.status == .proved then
-          return { result with status := .refuted, obligation := ← propositionText goal }
+          return ← cacheAttempt policy { result with status := .refuted, obligation := ← propositionText goal } cfg.cache
         trace := result.trace
     catch ex =>
       trace := s!"search exhausted or unsupported: {← ex.toMessageData.toString}"
@@ -249,6 +365,73 @@ where
       .forallE n domain (go body rest) (if role == .instanceRequirement then .instImplicit else bi)
     | _, _ => type
 
+private structure PreparedTheorem where
+  type : Expr
+  term : Expr
+  sharedCount : Nat
+
+/-- Move independent shared inputs before requirements, preserving the original application. -/
+private def prepareTheorem (term type : Expr) (roles : Array BinderRole) : MetaM PreparedTheorem :=
+  forallTelescope (applyRoles type roles) fun xs conclusion => do
+    let mut shared := #[]
+    let mut requirements := #[]
+    for i in [:xs.size] do
+      if roles[i]! == .sharedInput then shared := shared.push xs[i]!
+      else requirements := requirements.push xs[i]!
+    for input in shared do
+      let domain ← inferType input
+      if requirements.any (fun req => domain.containsFVar req.fvarId!) then
+        throwError "shared input depends on a requirement; supply a witness role or keep the dependency shared"
+    let ordered := shared ++ requirements
+    return {
+      type := ← mkForallFVars ordered conclusion
+      term := ← mkLambdaFVars ordered (mkAppN term xs)
+      sharedCount := shared.size
+    }
+
+private structure MatchingState where
+  steps : Nat := 0
+  solutions : Array (Array Nat) := #[]
+  exhausted : Bool := false
+
+/-- Match types after substituting earlier inputs; names never break ties. -/
+private partial def matchInputs (left right : Array Expr) (mapping : Array Nat)
+    (limit : Nat) (state : MatchingState) : MetaM MatchingState := do
+  if state.solutions.size ≥ 2 then return state
+  if mapping.size == left.size then
+    return { state with solutions := state.solutions.push mapping }
+  let mut state := state
+  let source := left[mapping.size]!
+  let sourceDecl ← source.fvarId!.getDecl
+  for j in [:right.size] do
+    if mapping.contains j then continue
+    if state.steps ≥ limit then return { state with exhausted := true }
+    state := { state with steps := state.steps + 1 }
+    let targetDecl ← right[j]!.fvarId!.getDecl
+    if sourceDecl.binderInfo != targetDecl.binderInfo then continue
+    let previousTargets := mapping.map (right[·]!)
+    let domain := targetDecl.type.replaceFVars previousTargets (left.extract 0 mapping.size)
+    if right.any (fun input => domain.containsFVar input.fvarId!) then continue
+    let saved ← saveState
+    if ← isDefEq sourceDecl.type domain then
+      state ← matchInputs left right (mapping.push j) limit state
+    saved.restore
+    if state.solutions.size ≥ 2 || state.exhausted then return state
+  return state
+
+private def structuralMapping (left right : PreparedTheorem) (limit : Nat) : MetaM MatchingState :=
+  forallTelescope left.type fun xs _ => forallTelescope right.type fun ys _ =>
+    matchInputs (xs.extract 0 left.sharedCount) (ys.extract 0 right.sharedCount) #[] limit {}
+
+private def permuteInputs (prepared : PreparedTheorem) (mapping : Array Nat) : MetaM PreparedTheorem :=
+  forallTelescope prepared.type fun xs conclusion => do
+    let inputs := mapping.map (xs[·]!)
+    let ordered := inputs ++ xs.extract prepared.sharedCount xs.size
+    return { prepared with
+      type := ← mkForallFVars ordered conclusion
+      term := ← mkLambdaFVars ordered (mkAppN prepared.term xs)
+    }
+
 private partial def align (left right : Expr) (count : Nat)
     (shared : Array Expr) (labels : Array String)
     (k : Array Expr → Array String → Expr → Expr → TermElabM ComparisonReport) :
@@ -279,7 +462,7 @@ private structure Transport where
 private partial def transport (sourceType targetConclusion source : Expr)
     (args : Array Expr) (cfg : Config) : TermElabM (Option Transport) := do
   if let .forallE n domain body bi := sourceType then
-    let some witness ← findTerm domain bi cfg | return none
+    let some witness ← findTerm domain bi cfg cfg.transportDepth | return none
     return ← withLocalDecl n bi domain fun x => do
       let some rest ← transport (body.instantiate1 x) targetConclusion source (args.push x) cfg
         | return none
@@ -333,12 +516,15 @@ private def compareDirection (shared : Array Expr) (sourceType targetType source
     let proof := mkApp contextExpr (mkAppN result.sourceResult inputs)
     mkLambdaFVars inputs proof
   let adapter ← certify (← inferType adapterProof) adapterProof #[targetName]
-    "composition of constructed requirements, source theorem, and contextual guarantee" context.usesSourceResult
+    "composition of constructed requirements, source theorem, and contextual guarantee" context.usesSourceResult cfg
   return (req, context, adapter)
 
 /-- Compare closed theorem declarations. Ambiguous/unsupported alignments stay UNKNOWN. -/
 def compareTheorems (source target : Name) (cfg : Config := {}) : TermElabM ComparisonReport := do
   if cfg.heartbeat == 0 then throwError "heartbeat must be positive (zero disables Lean's limit)"
+  if cfg.maxAlignmentSteps == 0 then throwError "maxAlignmentSteps must be positive"
+  if cfg.alignment != .explicit && !cfg.mapping.isEmpty then
+    throwError "mapping requires explicit alignment"
   let sourceInfo ← getConstInfo source
   let targetInfo ← getConstInfo target
   unless sourceInfo matches .thmInfo _ do throwError "source must be a theorem declaration"
@@ -357,13 +543,39 @@ def compareTheorems (source target : Name) (cfg : Config := {}) : TermElabM Comp
   }
   let prefix1 := roles1.takeWhile (· == .sharedInput) |>.size
   let prefix2 := roles2.takeWhile (· == .sharedInput) |>.size
-  if prefix1 != prefix2 || (roles1.extract prefix1 roles1.size).contains .sharedInput ||
-      (roles2.extract prefix2 roles2.size).contains .sharedInput then
+  if cfg.alignment == .positional && (prefix1 != prefix2 ||
+      (roles1.extract prefix1 roles1.size).contains .sharedInput ||
+      (roles2.extract prefix2 roles2.size).contains .sharedInput) then
     return { report with diagnostic := "ambiguous shared-input prefix; provide explicit role overrides" }
   try
-    align (applyRoles sourceType roles1) (applyRoles targetType roles2) prefix1 #[] #[] fun shared labels left right => do
-      let (req21, ctx12, adapter12) ← compareDirection shared left right sourceExpr source target cfg
-      let (req12, ctx21, adapter21) ← compareDirection shared right left targetExpr target source cfg
+    let prepared1 ← prepareTheorem sourceExpr sourceType roles1
+    let prepared2 ← prepareTheorem targetExpr targetType roles2
+    if prepared1.sharedCount != prepared2.sharedCount then
+      return { report with diagnostic := "different shared-input counts; supply explicit binder roles" }
+    let mut mapping := (Array.range prepared1.sharedCount)
+    let mut report := report
+    if cfg.alignment == .explicit then
+      unless cfg.mapping.size == prepared1.sharedCount &&
+          cfg.mapping.all (fun i => i > 0 && i ≤ prepared1.sharedCount) &&
+          cfg.mapping.toList.eraseDups.length == cfg.mapping.size do
+        return { report with diagnostic := "explicit mapping must be a one-based permutation of all shared inputs" }
+      mapping := cfg.mapping.map (· - 1)
+    if cfg.alignment == .structural then
+      let search ← withOptions (fun opts => maxHeartbeats.set opts cfg.heartbeat) <| withCurrHeartbeats <|
+        structuralMapping prepared1 prepared2 cfg.maxAlignmentSteps
+      report := { report with alignmentSearchSteps := search.steps }
+      if search.solutions.size ≥ 2 then
+        return { report with diagnostic := "ambiguous structural alignment; supply an explicit mapping" }
+      if search.exhausted then
+        return { report with diagnostic := "structural alignment search exhausted; supply a mapping or increase maxAlignmentSteps" }
+      let some unique := search.solutions[0]? |
+        return { report with diagnostic := "no structural alignment matches the shared-input dependency types" }
+      mapping := unique
+    report := { report with inputMap := mapping.map (· + 1) }
+    let prepared2 ← permuteInputs prepared2 mapping
+    align prepared1.type prepared2.type prepared1.sharedCount #[] #[] fun shared labels left right => do
+      let (req21, ctx12, adapter12) ← compareDirection shared left right prepared1.term source target cfg
+      let (req12, ctx21, adapter21) ← compareDirection shared right left prepared2.term target source cfg
       let mut g12 : Attempt := { trace := "logical mode disabled" }
       let mut g21 : Attempt := g12
       if cfg.mode != .contextual then
@@ -412,15 +624,23 @@ def Attempt.toJson (a : Attempt) : Json := Json.mkObj [
   ("closedKernelChecked", Lean.toJson a.certificate?.isSome),
   ("dependencies", strings a.dependencies), ("axioms", strings a.axioms),
   ("trace", Lean.toJson a.trace), ("wellFormed", Lean.toJson a.wellFormed),
+  ("cacheHit", Lean.toJson a.cacheHit),
   ("usesSourceResult", Lean.toJson a.usesSourceResult), ("usesTargetDecl", Lean.toJson a.usesTargetDecl)]
 
 def ComparisonReport.toJson (r : ComparisonReport) : Json := Json.mkObj [
-  ("schemaVersion", Lean.toJson (1 : Nat)), ("toolVersion", Lean.toJson "0.1.0"),
+  ("schemaVersion", Lean.toJson (2 : Nat)), ("toolVersion", Lean.toJson "0.2.0"),
   ("leanVersion", Lean.toJson Lean.versionString),
   ("source", Lean.toJson r.source.toString), ("target", Lean.toJson r.target.toString),
-  ("alignmentPolicy", Lean.toJson "positional shared-input prefix; definitional equality"),
+  ("alignmentPolicy", Lean.toJson r.config.alignment.label),
   ("alignment", Lean.toJson r.alignment), ("roles", Lean.toJson r.roles),
-  ("background", Lean.toJson background), ("explicitFacts", strings r.config.facts),
+  ("inputMap", Lean.toJson r.inputMap), ("alignmentSearchSteps", Lean.toJson r.alignmentSearchSteps),
+  ("maxAlignmentSteps", Lean.toJson r.config.maxAlignmentSteps),
+  ("background", Lean.toJson (background r.config)), ("explicitFacts", strings r.config.facts),
+  ("forbiddenDecls", strings (#[r.source, r.target] ++ r.config.forbiddenDecls)),
+  ("allowedAxioms", Lean.toJson (r.config.allowedAxioms?.map (·.map toString))),
+  ("synthInstances", Lean.toJson r.config.synthInstances),
+  ("constructors", strings r.config.constructors), ("transportDepth", Lean.toJson r.config.transportDepth),
+  ("cacheEnabled", Lean.toJson r.config.cache),
   ("heartbeatPerAttempt", Lean.toJson r.config.heartbeat),
   ("diagnostic", Lean.toJson r.diagnostic), ("classification", Lean.toJson r.classification),
   ("requirementsTargetToSource", r.req_2_to_1.toJson),
@@ -434,8 +654,9 @@ def ComparisonReport.toJson (r : ComparisonReport) : Json := Json.mkObj [
   ("semanticComparisons", Lean.toJson (#[] : Array Json))]
 
 def ComparisonReport.format (r : ComparisonReport) : String := Id.run do
-  let mut lines := #[s!"{r.source} vs {r.target}", "ALIGNMENT (positional)"] ++ r.alignment ++ r.roles
-  lines := lines.push s!"BACKGROUND: {background}; explicit facts: {r.config.facts}"
+  let mut lines := #[s!"{r.source} vs {r.target}", s!"ALIGNMENT ({r.config.alignment.label}); input map: {r.inputMap}"] ++ r.alignment ++ r.roles
+  lines := lines.push s!"BACKGROUND: {background r.config}; explicit facts: {r.config.facts}"
+  lines := lines.push s!"forbidden declarations: {r.config.forbiddenDecls}; allowed axioms: {r.config.allowedAxioms?}"
   if !r.diagnostic.isEmpty then lines := lines.push r.diagnostic
   for (label, edge) in #[
       ("requirements target => source", r.req_2_to_1),
@@ -449,7 +670,7 @@ def ComparisonReport.format (r : ComparisonReport) : String := Id.run do
     lines := lines.push s!"{label}: {if edge.wellFormed then edge.status.label else "NOT-WELL-FORMED"}"
     if !edge.obligation.isEmpty then lines := lines.push s!"  obligation: {edge.obligation}"
     if let some name := edge.certificate? then
-      lines := lines.push s!"  certificate: {name} (closed / kernel checked)"
+      lines := lines.push s!"  certificate: {name} (closed / kernel checked; cache hit: {edge.cacheHit})"
       lines := lines.push s!"  dependencies: {edge.dependencies.size} declarations; axioms: {edge.axioms}"
       if r.config.verbose then lines := lines.push s!"  dependencies: {edge.dependencies}"
     if r.config.verbose then
@@ -462,8 +683,16 @@ syntax "(roles1" " := " "[" ident,* "]" ")" : comparisonOption
 syntax "(roles2" " := " "[" ident,* "]" ")" : comparisonOption
 syntax "(mode" " := " "." ident ")" : comparisonOption
 syntax "(alignment" " := " "." ident ")" : comparisonOption
+syntax "(mapping" " := " "[" num,* "]" ")" : comparisonOption
+syntax "(maxAlignmentSteps" " := " num ")" : comparisonOption
 syntax "(heartbeat" " := " num ")" : comparisonOption
 syntax "(using" " := " "[" ident,* "]" ")" : comparisonOption
+syntax "(forbidden" " := " "[" ident,* "]" ")" : comparisonOption
+syntax "(allowedAxioms" " := " "[" ident,* "]" ")" : comparisonOption
+syntax "(constructors" " := " "[" ident,* "]" ")" : comparisonOption
+syntax "(synthInstances" " := " ident ")" : comparisonOption
+syntax "(transportDepth" " := " num ")" : comparisonOption
+syntax "(cache" " := " ident ")" : comparisonOption
 syntax "(verbose" " := " ident ")" : comparisonOption
 syntax "(json" " := " ident ")" : comparisonOption
 syntax (name := compareCommand) "#compare_theorems " ident ident comparisonOption* : command
@@ -493,12 +722,29 @@ private def parseBool (stx : TSyntax `ident) : Command.CommandElabM Bool := do
     | `(comparisonOption| (roles2 := [$roles:ident,*])) =>
       cfg := { cfg with roles2 := ← roles.getElems.mapM parseRole }
     | `(comparisonOption| (heartbeat := $n:num)) => cfg := { cfg with heartbeat := n.getNat }
+    | `(comparisonOption| (mapping := [$indices:num,*])) =>
+      cfg := { cfg with mapping := indices.getElems.map (·.getNat) }
+    | `(comparisonOption| (maxAlignmentSteps := $n:num)) => cfg := { cfg with maxAlignmentSteps := n.getNat }
+    | `(comparisonOption| (transportDepth := $n:num)) => cfg := { cfg with transportDepth := n.getNat }
     | `(comparisonOption| (using := [$facts,*])) =>
       cfg := { cfg with facts := ← facts.getElems.mapM fun fact => Command.liftCoreM <| realizeGlobalConstNoOverloadWithInfo fact }
+    | `(comparisonOption| (forbidden := [$facts:ident,*])) =>
+      cfg := { cfg with forbiddenDecls := ← facts.getElems.mapM fun fact => Command.liftCoreM <| realizeGlobalConstNoOverloadWithInfo fact }
+    | `(comparisonOption| (allowedAxioms := [$facts:ident,*])) =>
+      cfg := { cfg with allowedAxioms? := some (← facts.getElems.mapM fun fact => Command.liftCoreM <| realizeGlobalConstNoOverloadWithInfo fact) }
+    | `(comparisonOption| (constructors := [$facts:ident,*])) =>
+      cfg := { cfg with constructors := ← facts.getElems.mapM fun fact => Command.liftCoreM <| realizeGlobalConstNoOverloadWithInfo fact }
+    | `(comparisonOption| (synthInstances := $b:ident)) => cfg := { cfg with synthInstances := ← parseBool b }
+    | `(comparisonOption| (cache := $b:ident)) => cfg := { cfg with cache := ← parseBool b }
     | `(comparisonOption| (verbose := $b:ident)) => cfg := { cfg with verbose := ← parseBool b }
     | `(comparisonOption| (json := $b:ident)) => cfg := { cfg with json := ← parseBool b }
     | `(comparisonOption| (alignment := .$mode:ident)) =>
-      unless mode.getId == `positional do throwErrorAt mode "MVP supports positional alignment"
+      let alignment ← match mode.getId with
+        | `positional => pure AlignmentMode.positional
+        | `structural => pure AlignmentMode.structural
+        | `explicit => pure AlignmentMode.explicit
+        | _ => throwErrorAt mode "expected positional, structural, or explicit"
+      cfg := { cfg with alignment }
     | `(comparisonOption| (mode := .$mode:ident)) =>
       let mode ← match mode.getId with
         | `all => pure ComparisonMode.all
